@@ -49,7 +49,14 @@ static int __init droid_lkm_compat_init(void)
 	pr_info("[droid_lkm_compat] hook policy: inline_hook=%d\n",
 		dlc_inline_hooks_on);
 
-	dlc_ghost_init();
+	ret = dlc_ghost_init();
+	if (ret) {
+		pr_err("[droid_lkm_compat] vendor fixup unavailable: %d; refusing load\n", ret);
+		dlc_ghost_exit();
+		hk_exit();
+		hk_exit_block();
+		return ret;
+	}
 
 #ifdef CONFIG_DROID_LKM_SELFTEST
 	dlc_selftest_init();
@@ -65,6 +72,7 @@ static void __exit droid_lkm_compat_exit(void)
 #endif
 	dlc_ghost_exit();
 	hk_exit();
+	hk_exit_block();
 }
 
 module_init(droid_lkm_compat_init);

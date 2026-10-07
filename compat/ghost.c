@@ -29,17 +29,14 @@ static char *dlc_ghost_match = "oplus_";
 module_param_named(ghost_match, dlc_ghost_match, charp, 0444);
 MODULE_PARM_DESC(ghost_match, "caller module name prefix, * matches all, default oplus_");
 
-static typeof(&find_task_by_vpid) dlc_ftbv_orig;
 static typeof(&__module_address) dlc_module_address;
 extern bool dlc_inline_hooks_on;
 
 /*
- * inline hooks rewrite the entry of a live kernel function and the device owner
- * suspects the hypervisor refuses that store on MTK, so they are off by default
- * while everything else stays on. inline_hook=1 brings them back, a refused hook
- * is not fatal, the ghost feature just stays unavailable
+ * The vendor fixup requires this inline hook. Disabling it while ghost=1
+ * refuses module initialization; ghost=0 explicitly requests no vendor fixup.
  */
-static inline int dlc_inline_hook(struct hk_inline *h, const char *sym,
+static inline int dlc_do_inline_hook(struct hk_inline *h, const char *sym,
 				  const char *wrap)
 {
 	if (!dlc_inline_hooks_on) {
@@ -78,13 +75,19 @@ __nocfi noinline struct task_struct *dlc_ftbv_wrap(pid_t vnr)
 {
 	unsigned long ret_ip = (unsigned long)_RET_IP_;
 	struct task_struct *task;
+	typeof(&find_task_by_vpid) orig;
 	struct module *mod;
 	bool match = false;
 
-	if (unlikely(!dlc_ftbv_orig))
+	/* HooKern publishes h->orig before patching the live entry. A separate
+	 * pointer assigned after hk_inline_hook() returns leaves a window in
+	 * which vendor callers receive NULL even though the hook is installed.
+	 */
+	orig = (typeof(orig))READ_ONCE(dlc_ftbv_hook.orig);
+	if (unlikely(!orig))
 		return NULL;
 
-	task = dlc_ftbv_orig(vnr);
+	task = orig(vnr);
 	if (likely(task))
 		return task;
 
@@ -169,6 +172,10 @@ int dlc_ghost_init(void)
 
 	if (!dlc_ghost_enable)
 		return 0;
+	if (!dlc_inline_hooks_on) {
+		pr_err("[droid_lkm_compat] ghost=1 requires inline_hook=1\n");
+		return -EOPNOTSUPP;
+	}
 
 	ret = dlc_ghost_build();
 	if (ret) {
@@ -195,8 +202,13 @@ int dlc_ghost_init(void)
 		struct hk_inline_probe probe;
 
 		memset(&probe, 0, sizeof(probe));
-		if (!hk_inline_probe("find_task_by_vpid", &probe) &&
-		    probe.state != HK_INLINE_PLAIN) {
+		ret = hk_inline_probe("find_task_by_vpid", &probe);
+		if (ret) {
+			pr_err("[droid_lkm_compat] ghost: entry probe failed %d\n", ret);
+			dlc_ghost_ready = false;
+			return ret;
+		}
+		if (probe.state != HK_INLINE_PLAIN) {
 			pr_err("[droid_lkm_compat] ghost: find_task_by_vpid entry state %d (%s) target 0x%lx, inline hook refused\n",
 			       probe.state, probe.reason ? probe.reason : "?",
 			       probe.target);
@@ -205,13 +217,12 @@ int dlc_ghost_init(void)
 		}
 	}
 
-	ret = dlc_inline_hook(&dlc_ftbv_hook, "find_task_by_vpid", "dlc_ftbv_wrap");
+	ret = dlc_do_inline_hook(&dlc_ftbv_hook, "find_task_by_vpid", "dlc_ftbv_wrap");
 	if (ret) {
 		pr_err("[droid_lkm_compat] ghost: hook find_task_by_vpid failed %d\n", ret);
 		dlc_ghost_ready = false;
 		return ret;
 	}
-	dlc_ftbv_orig = (typeof(dlc_ftbv_orig))dlc_ftbv_hook.orig;
 	pr_info("[droid_lkm_compat] ghost: find_task_by_vpid hooked, match=%s\n",
 		dlc_ghost_match ? dlc_ghost_match : "");
 	return 0;

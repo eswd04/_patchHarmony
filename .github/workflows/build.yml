@@ -9,10 +9,18 @@ on:
       - 'mk/**'
       - 'deps.lst'
       - 'scripts/fetch-deps.sh'
+      - 'tests/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
+  host-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test vendor fixup initialization failures
+        run: python3 tests/run-compat-unit.py
+
   build-matrix:
     strategy:
       matrix:
