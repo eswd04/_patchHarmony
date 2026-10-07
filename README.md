@@ -11,6 +11,8 @@ keep working.
 this repository is the `Kern/` submodule of the Droidspaces fork, published as
 `git@github.com:Dere3046/_patchHarmony.git`.
 
+This fork is maintained at [eswd04/_patchHarmony](https://github.com/eswd04/_patchHarmony).
+
 three modules are built:
 
 - `droid_lkm.ko` namespace and IPC support
@@ -51,11 +53,12 @@ three modules are built:
 
 `fetch-deps.sh` clones the SDK at the revision in `.sdk-version` and vendors
 every library listed in `deps.lst` below `deps/`. `build-ddkk.sh <target>` runs
-the DDK container and writes both modules plus their build tree into
+the DDK container and writes the target modules plus their build tree into
 `out/<target>/`. library sources are never committed here, `deps.lst` pins the
 exact revision of each one.
 
-`android15-6.6` is a supported target as well, same modules and features.
+`android15-6.6` is a supported target for the main namespace/IPC module;
+the OnePlus 15 User NS compatibility module targets 6.12.
 
 ## usage
 
@@ -64,8 +67,9 @@ exact revision of each one.
 	insmod droid_lkm_misc.ko
 
 load `droid_lkm.ko` before any container starts, then `droid_lkm_compat.ko` for
-the vendor fixups, then `droid_lkm_misc.ko`. the third resolves the one entry
-point it wants from the first by name at load time, so it also works alone.
+the vendor fixups, then `droid_lkm_misc.ko`. With `userns=1`, the third module
+resolves and pins the namespace registration interface provided by the first;
+the main module must already be loaded.
 every module resolves its kernel symbols at load time and reports anything it
 cannot find; a missing core symbol aborts the load instead of leaving a half
 installed hook behind.
@@ -92,15 +96,18 @@ an out of bounds access. the module answers those callers with a substitute task
 that carries a bounded pid, selected by module name prefix (`oplus_` by default,
 `*` matches every caller).
 
+When `ghost=1` (the default), initialization now fails if the entry probe or
+hook installation fails, or if `inline_hook=0`. A successful load must provide
+the vendor fixup. See [OnePlus 15 reboot investigation](docs/oneplus15-compat-reboot.md)
+for the regression in `513d40a` and the matching local build.
+
 Xiaomi devices do not install this module: MIUI and HyperOS vendor modules do not
 rely on that pattern, so the compat half is not needed there.
 
 ## known limits
 
-- the user namespace is at its first level: unshare and clone produce one, the
-  credential, the namespace owners and the id map files are right, but the map is
-  the identity map, so a write that asks for anything else, and `setgroups` in a
-  container, are refused rather than half honoured
+- the user namespace supports root-only full identity mappings; see
+  [OnePlus 15 User NS](docs/oneplus15-userns.md) for the supported interface
 - no idmapped mount lens, so a non identity mount cannot be permission checked
 - no cgroup pids or device controllers
 - no nftables match set, and only the addrtype xt match is ported so far
@@ -110,10 +117,14 @@ rely on that pattern, so the compat half is not needed there.
   superblock from being torn down after the code is gone. write `1` to
   `/sys/module/droid_lkm_misc/parameters/release` to drop the internal mount
   before unloading, the same discipline as unmounting before `rmmod`
-- namespace lifetime is owned by the module: unloading while a container runs
-  leaves that namespace neutralized, and a namespace is not freed until then, so
-  `unshare(CLONE_NEWUSER)` leaves an object behind. `status` reports how many are
-  live
+- User NS objects, cached proc entries and nsfs operations retain the misc
+  module until reboot once published; the main module is pinned as its
+  dependency. At most 1024 User NS objects are retained. This replaces the
+  previous unsafe free-on-unload behavior.
+- `droid_lkm_misc.ko` currently builds only for 6.12; the earlier targets
+  continue to build the main module and compatible optional vendor module.
+- map files support direct lookup/open; the host proc directory's compiled
+  entry list does not enumerate these extra files.
 
 ## credits
 
