@@ -20,6 +20,10 @@ DEPS_OBJS_ALL := $(filter-out deps/Type_info/lib/btf.o \
 # optional HooKern features we do not use
 DEPS_OBJS_ALL := $(filter-out deps/HooKern/lib/hk_binder.o deps/HooKern/lib/hk_lsm.o,$(DEPS_OBJS_ALL))
 
+# Compile a generated overlay, keeping the fetched HooKern tree unchanged.
+HK_INLINE_SOURCE := $(firstword $(wildcard $(MDIR)/deps/HooKern/lib/hk_inline.c $(SDK_ROOT)/builtin/HooKern/lib/hk_inline.c))
+DEPS_OBJS_ALL := $(filter-out deps/HooKern/lib/hk_inline.o .sdk/builtin/HooKern/lib/hk_inline.o,$(DEPS_OBJS_ALL)) src/core/ds_inline.o
+
 # second ko in the same Kbuild: device quirk fixups, independent of droid_lkm
 #   ghost task fallback for find_task_by_vpid
 #   selftest probe, TEST=1 builds only
@@ -160,6 +164,7 @@ ccflags-y += -I$(src)/src/ipcns/compat
 ccflags-y += -I$(src)/src/misc -I$(src)/src/misc/xt -I$(src)/src/misc/userns
 ccflags-y += -I$(src)/src/misc/devtmpfs
 ccflags-y += $(addprefix -I$(src)/,$(DEPS_INCS_ALL))
+ccflags-y += -I$(obj)/src/core
 
 # KernCall: enable sys_call_table slot patching
 ccflags-y += -DCONFIG_KERNSC_PATCH -DCONFIG_KERNSC_DISCOVER
@@ -176,3 +181,10 @@ $(obj)/%.o: $(src)/%.c $(recordmcount_source) FORCE
 
 $(obj)/%.o: $(src)/%.S FORCE
 	$(call if_changed_rule,as_o_S)
+
+$(obj)/src/core/ds_inline_impl.h: $(HK_INLINE_SOURCE) $(src)/scripts/fix-hookern-inline.py
+	python3 $(src)/scripts/fix-hookern-inline.py $(HK_INLINE_SOURCE) $@
+
+$(obj)/src/core/ds_inline.o: $(src)/src/core/ds_inline.c $(obj)/src/core/ds_inline_impl.h FORCE
+	$(call if_changed_rule,cc_o_c)
+	$(call cmd,force_checksrc)
