@@ -107,7 +107,8 @@ void droid_lkm_userns_map_identity(struct droid_lkm_userns *u)
 	gid->extent[0].count = 4294967295U;
 	gid->nr_extents = 1;
 
-	u->map_written = true;
+	/* Identity storage is required by the host inline conversion stubs.
+	 * Track userspace writes separately, once for each map. */
 }
 
 /* layer one, the map functions are pure, the whole input domain runs without a task */

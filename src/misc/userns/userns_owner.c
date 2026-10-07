@@ -60,11 +60,13 @@ struct user_namespace *droid_lkm_userns_init_uns;
 
 static struct hk_inline droid_lkm_userns_copymntns_hook;
 static struct hk_inline droid_lkm_userns_fsctx_hook;
-static struct mnt_namespace *(*droid_lkm_userns_copymntns_orig)(
+typedef struct mnt_namespace *(*droid_lkm_userns_copymntns_orig_t)(
 		unsigned long flags, struct mnt_namespace *ns,
 		struct user_namespace *user_ns, struct fs_struct *new_fs);
-static struct fs_context *(*droid_lkm_userns_fsctx_orig)(
+#define droid_lkm_userns_copymntns_orig ((droid_lkm_userns_copymntns_orig_t)READ_ONCE(droid_lkm_userns_copymntns_hook.orig))
+typedef struct fs_context *(*droid_lkm_userns_fsctx_orig_t)(
 		struct file_system_type *type, unsigned int sb_flags);
+#define droid_lkm_userns_fsctx_orig ((droid_lkm_userns_fsctx_orig_t)READ_ONCE(droid_lkm_userns_fsctx_hook.orig))
 static const struct proc_ns_operations *droid_lkm_userns_mnt_ops;
 static droid_lkm_userns_owner_t droid_lkm_userns_mnt_owner;
 static unsigned int droid_lkm_userns_mnt_off;
@@ -72,7 +74,7 @@ static unsigned int droid_lkm_userns_mnt_off;
 static bool droid_lkm_userns_is_text(unsigned long addr)
 {
 	return addr >= kernel_base && addr - kernel_base < DROID_LKM_USERNS_TEXT_WIN &&
-	       !(addr & (sizeof(void *) - 1));
+	       !(addr & 3UL); /* A64 instructions are 4-byte aligned, not pointer aligned. */
 }
 
 /*
@@ -94,14 +96,21 @@ static int droid_lkm_userns_mnt_ops_resolve(void)
 	if (safe_read(&ops, (void *)addr, sizeof(ops)))
 		return -EFAULT;
 
-	if (!ops.name || safe_read(text, ops.name, 4) || memcmp(text, "mnt", 4))
+	if (!ops.name || safe_read(text, ops.name, 4) || memcmp(text, "mnt", 4)) {
+		droid_lkm_misc_warn("mntns_operations name validation failed\n");
 		return -EINVAL;
+	}
 
-	if (ops.type != CLONE_NEWNS)
+	if (ops.type != CLONE_NEWNS) {
+		droid_lkm_misc_warn("mntns_operations type invalid: 0x%x\n", ops.type);
 		return -EINVAL;
+	}
 
-	if (!ops.owner || !droid_lkm_userns_is_text((unsigned long)ops.owner))
+	if (!ops.owner || !droid_lkm_userns_is_text((unsigned long)ops.owner)) {
+		droid_lkm_misc_warn("mntns_operations owner outside aligned text window: 0x%lx (base 0x%lx)\n",
+			(unsigned long)ops.owner, kernel_base);
 		return -EINVAL;
+	}
 
 	droid_lkm_userns_mnt_ops = (const struct proc_ns_operations *)addr;
 	droid_lkm_userns_mnt_owner = ops.owner;
@@ -239,17 +248,14 @@ int droid_lkm_userns_owner_init(void)
 		droid_lkm_misc_warn("hook copy_mnt_ns failed: %d\n", ret);
 		return ret;
 	}
-	droid_lkm_userns_copymntns_orig = (void *)droid_lkm_userns_copymntns_hook.orig;
 
 	ret = hk_inline_hook(&droid_lkm_userns_fsctx_hook, "fs_context_for_mount",
 			     "droid_lkm_userns_fsctx_wrap");
 	if (ret) {
 		droid_lkm_misc_warn("hook fs_context_for_mount failed: %d\n", ret);
 		hk_inline_unhook(&droid_lkm_userns_copymntns_hook);
-		droid_lkm_userns_copymntns_orig = NULL;
 		return ret;
 	}
-	droid_lkm_userns_fsctx_orig = (void *)droid_lkm_userns_fsctx_hook.orig;
 
 	droid_lkm_misc_dbg("owner: mntns_ops=0x%lx owner=0x%lx, both hooks up\n",
 		(unsigned long)droid_lkm_userns_mnt_ops,
@@ -262,10 +268,8 @@ void droid_lkm_userns_owner_exit(void)
 {
 	if (droid_lkm_userns_fsctx_orig) {
 		hk_inline_unhook(&droid_lkm_userns_fsctx_hook);
-		droid_lkm_userns_fsctx_orig = NULL;
 	}
 	if (droid_lkm_userns_copymntns_orig) {
 		hk_inline_unhook(&droid_lkm_userns_copymntns_hook);
-		droid_lkm_userns_copymntns_orig = NULL;
 	}
 }

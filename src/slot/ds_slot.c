@@ -19,6 +19,10 @@
 #include <linux/uaccess.h>
 #include <linux/capability.h>
 #include <linux/user_namespace.h>
+#include <linux/utsname.h>
+#include <linux/cgroup.h>
+#include <linux/time_namespace.h>
+#include <net/net_namespace.h>
 
 #include "ds.h"
 #include "ds_ksym.h"
@@ -499,6 +503,25 @@ static struct hk_inline droid_lkm_cnn_hook;
 static bool droid_lkm_cnn_hooked;
 static int (*droid_lkm_check_unshare_flags_fn)(unsigned long flags);
 
+/* CONFIG_USER_NS=n constructors use get_user_ns()'s host stub. Only
+ * newly created objects may have their owner replaced; shared ones stay put. */
+static void droid_lkm_cnn_fix_owner(struct nsproxy *nsp, unsigned long flags,
+				  struct user_namespace *user_ns)
+{
+	if (IS_ERR(nsp) || user_ns == &init_user_ns)
+		return;
+	if (flags & CLONE_NEWUTS)
+		nsp->uts_ns->user_ns = user_ns;
+	if (flags & CLONE_NEWNET)
+		nsp->net_ns->user_ns = user_ns;
+	if (flags & CLONE_NEWCGROUP)
+		nsp->cgroup_ns->user_ns = user_ns;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+	if ((flags & CLONE_NEWTIME) && nsp->time_ns_for_children)
+		nsp->time_ns_for_children->user_ns = user_ns;
+#endif
+}
+
 __nocfi noinline struct nsproxy *droid_lkm_cnn_wrap(unsigned long flags,
 					     struct task_struct *tsk,
 					     struct user_namespace *user_ns,
@@ -510,8 +533,11 @@ __nocfi noinline struct nsproxy *droid_lkm_cnn_wrap(unsigned long flags,
 	struct ipc_namespace *new_ipc = NULL;
 	struct nsproxy *nsp;
 
-	if (!want_pid && !want_ipc)
-		return droid_lkm_cnn_orig(flags, tsk, user_ns, fs);
+	if (!want_pid && !want_ipc) {
+		nsp = droid_lkm_cnn_orig(flags, tsk, user_ns, fs);
+		droid_lkm_cnn_fix_owner(nsp, flags, user_ns);
+		return nsp;
+	}
 
 
 	if (!droid_lkm_gate_allow())
@@ -553,10 +579,15 @@ __nocfi noinline struct nsproxy *droid_lkm_cnn_wrap(unsigned long flags,
 		return nsp;
 	}
 
-	if (want_pid)
+	droid_lkm_cnn_fix_owner(nsp, flags, user_ns);
+	if (want_pid) {
+		new_pid->user_ns = user_ns;
 		nsp->pid_ns_for_children = new_pid;
-	if (want_ipc)
+	}
+	if (want_ipc) {
+		new_ipc->user_ns = user_ns;
 		nsp->ipc_ns = new_ipc;
+	}
 
 	droid_lkm_dbg("nsproxy: flags=0x%lx pid=%d ipc=%d -> %p\n", flags,
 	       (int)want_pid, (int)want_ipc, nsp);
@@ -623,7 +654,7 @@ __nocfi noinline int droid_lkm_cn_wrap(unsigned long flags, struct task_struct *
 
 
 	if (!(inner & DROID_LKM_NS_FLAGS)) {
-		priv = droid_lkm_cnn_orig(0, tsk, current_user_ns(), tsk->fs);
+		priv = droid_lkm_cnn_orig(0, tsk, tsk->cred->user_ns, tsk->fs);
 		if (IS_ERR(priv)) {
 			droid_lkm_pidns_put(new_pid);
 			droid_lkm_ipcns_put(new_ipc);
@@ -632,10 +663,14 @@ __nocfi noinline int droid_lkm_cn_wrap(unsigned long flags, struct task_struct *
 		droid_lkm_ks.switch_task_namespaces(tsk, priv);
 	}
 
-	if (want_pid)
+	if (want_pid) {
+		new_pid->user_ns = tsk->cred->user_ns;
 		tsk->nsproxy->pid_ns_for_children = new_pid;
-	if (want_ipc)
+	}
+	if (want_ipc) {
+		new_ipc->user_ns = tsk->cred->user_ns;
 		tsk->nsproxy->ipc_ns = new_ipc;
+	}
 
 	droid_lkm_dbg("clone ns: flags=0x%lx pid=%d ipc=%d -> %p\n", flags,
 	       (int)want_pid, (int)want_ipc, tsk->nsproxy);
@@ -660,7 +695,7 @@ static __nocfi noinline bool droid_lkm_unshare_precheck(unsigned long flags)
 
 
 	if ((flags & DROID_LKM_NS_ALL) &&
-	    !ns_capable(current_user_ns(), CAP_SYS_ADMIN))
+	    !ns_capable(current_cred()->user_ns, CAP_SYS_ADMIN))
 		return false;
 
 	if ((flags & CLONE_NEWPID) && current->nsproxy &&

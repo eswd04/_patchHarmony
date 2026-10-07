@@ -40,15 +40,23 @@
 #include <linux/proc_fs.h>
 #include <linux/uaccess.h>
 #include <linux/user_namespace.h>
+#include <linux/mutex.h>
+#include <linux/capability.h>
 
 #include "misc.h"
 #include "misc_ksym.h"
 #include "misc_proc.h"
 #include "userns.h"
 #include "hk_inline.h"
+#include "proc_inode.h"
 
 /* "         0          0 4294967295\n" and room for the setgroups answer */
 #define DROID_LKM_USERNS_MAP_TEXT 64
+static DEFINE_MUTEX(droid_lkm_userns_map_lock);
+static bool droid_lkm_userns_proc_pinned;
+/* KCFI hashes include pointee qualifiers. Use the kernel declaration so
+ * const struct file * cannot drift into struct file * and panic on map writes. */
+static typeof(&file_ns_capable) droid_lkm_userns_file_capable;
 
 struct droid_lkm_userns_proc_file {
 	const char *name;
@@ -72,15 +80,16 @@ static const struct dentry_operations *droid_lkm_userns_proc_dentry_ops;
 
 static struct hk_inline droid_lkm_userns_proc_tgid_hook;
 static struct hk_inline droid_lkm_userns_proc_tid_hook;
-static struct dentry *(*droid_lkm_userns_proc_tgid_orig)(struct inode *dir,
+typedef struct dentry *(*droid_lkm_userns_proc_tgid_orig_t)(struct inode *dir,
 		struct dentry *dentry, unsigned int flags);
-static struct dentry *(*droid_lkm_userns_proc_tid_orig)(struct inode *dir,
+#define droid_lkm_userns_proc_tgid_orig ((droid_lkm_userns_proc_tgid_orig_t)READ_ONCE(droid_lkm_userns_proc_tgid_hook.orig))
+typedef struct dentry *(*droid_lkm_userns_proc_tid_orig_t)(struct inode *dir,
 		struct dentry *dentry, unsigned int flags);
+#define droid_lkm_userns_proc_tid_orig ((droid_lkm_userns_proc_tid_orig_t)READ_ONCE(droid_lkm_userns_proc_tid_hook.orig))
 
 /*
- * upstream renders through seq_file and converts with from_kuid(), which is the identity stub
- * here, and every namespace reachable carries the identity map, so the extent is printed as
- * stored. stage 2b has to make this a real conversion
+ * The compatibility mode only has one full identity extent; render it
+ * directly. The open-file namespace snapshot is stable until reboot.
  */
 static int droid_lkm_userns_map_text(const struct uid_gid_map *map, char *buf,
 				     int size)
@@ -130,7 +139,7 @@ static bool droid_lkm_userns_map_is_identity(const char *text)
 			digits++;
 		}
 
-		if (!digits)
+		if (!digits || (i < 2 && *s != ' ' && *s != '\t'))
 			return false;
 	}
 
@@ -154,9 +163,13 @@ static ssize_t droid_lkm_userns_map_read(char __user *ubuf, size_t count,
 }
 
 static ssize_t droid_lkm_userns_map_write(struct file *file, const char __user *ubuf,
-					  size_t count, loff_t *ppos)
+					  size_t count, loff_t *ppos, bool gid)
 {
-	struct user_namespace *ns = file_inode(file)->i_private;
+	struct user_namespace *ns = file->private_data;
+	struct droid_lkm_userns *u;
+	struct user_namespace *cap_ns;
+	bool *written;
+	int ret = 0;
 	char text[DROID_LKM_USERNS_MAP_TEXT];
 
 	/* upstream: one write, at the beginning, of less than a page */
@@ -167,7 +180,16 @@ static ssize_t droid_lkm_userns_map_write(struct file *file, const char __user *
 	 * the initial namespace's map is already identity and upstream refuses a second write, so
 	 * this is refused too
 	 */
-	if (!ns || ns == droid_lkm_userns_init_uns)
+	if (!droid_lkm_userns_is_ours(ns))
+		return -EPERM;
+	u = container_of(ns, struct droid_lkm_userns, uns);
+	/* This acknowledges an already active identity map. A creator in the
+	 * child may acknowledge it using child caps; creation checked all
+	 * parent capabilities before making the map active. */
+	cap_ns = file->f_cred->user_ns == ns ? ns : ns->parent;
+	if ((current_cred()->user_ns != ns && current_cred()->user_ns != ns->parent) ||
+	    !droid_lkm_userns_file_capable(file, cap_ns, gid ? CAP_SETGID : CAP_SETUID) ||
+	    (!gid && !droid_lkm_userns_file_capable(file, cap_ns, CAP_SETFCAP)))
 		return -EPERM;
 
 	if (!count)
@@ -176,19 +198,40 @@ static ssize_t droid_lkm_userns_map_write(struct file *file, const char __user *
 	if (copy_from_user(text, ubuf, count))
 		return -EFAULT;
 	text[count] = 0;
+	if (memchr(text, 0, count))
+		return -EINVAL;
 
 	if (!droid_lkm_userns_map_is_identity(text))
 		return -EPERM;
 
-	*ppos += count;
+	mutex_lock(&droid_lkm_userns_map_lock);
+	written = gid ? &u->gid_written : &u->uid_written;
+	if (*written)
+		ret = -EPERM;
+	else {
+		*written = true;
+		*ppos += count;
+	}
+	mutex_unlock(&droid_lkm_userns_map_lock);
+	return ret ? ret : count;
+}
 
-	return count;
+static ssize_t droid_lkm_userns_uid_map_write(struct file *file,
+	const char __user *ubuf, size_t count, loff_t *ppos)
+{
+	return droid_lkm_userns_map_write(file, ubuf, count, ppos, false);
+}
+
+static ssize_t droid_lkm_userns_gid_map_write(struct file *file,
+	const char __user *ubuf, size_t count, loff_t *ppos)
+{
+	return droid_lkm_userns_map_write(file, ubuf, count, ppos, true);
 }
 
 static ssize_t droid_lkm_userns_uid_map_read(struct file *file, char __user *ubuf,
 					     size_t count, loff_t *ppos)
 {
-	struct user_namespace *ns = file_inode(file)->i_private;
+	struct user_namespace *ns = file->private_data;
 
 	return droid_lkm_userns_map_read(ubuf, count, ppos,
 		ns ? &ns->uid_map : NULL);
@@ -197,7 +240,7 @@ static ssize_t droid_lkm_userns_uid_map_read(struct file *file, char __user *ubu
 static ssize_t droid_lkm_userns_gid_map_read(struct file *file, char __user *ubuf,
 					     size_t count, loff_t *ppos)
 {
-	struct user_namespace *ns = file_inode(file)->i_private;
+	struct user_namespace *ns = file->private_data;
 
 	return droid_lkm_userns_map_read(ubuf, count, ppos,
 		ns ? &ns->gid_map : NULL);
@@ -206,7 +249,7 @@ static ssize_t droid_lkm_userns_gid_map_read(struct file *file, char __user *ubu
 static ssize_t droid_lkm_userns_setgroups_read(struct file *file, char __user *ubuf,
 					       size_t count, loff_t *ppos)
 {
-	struct user_namespace *ns = file_inode(file)->i_private;
+	struct user_namespace *ns = file->private_data;
 	const char *text = "allow\n";
 
 	if (ns && !(READ_ONCE(ns->flags) & USERNS_SETGROUPS_ALLOWED))
@@ -216,31 +259,87 @@ static ssize_t droid_lkm_userns_setgroups_read(struct file *file, char __user *u
 }
 
 /*
- * upstream stores the answer in user_namespace.flags and may_setgroups() reads it back
- * through a stub that answers true, so accepting the write would set a flag nothing reads
+ * Store the one-way setgroups policy; the syscall hook enforces it even
+ * where the host has inlined userns_may_setgroups() to true.
  */
 static ssize_t droid_lkm_userns_setgroups_write(struct file *file,
 						const char __user *ubuf,
 						size_t count, loff_t *ppos)
 {
-	return -EPERM;
+	struct user_namespace *ns = file->private_data;
+	struct droid_lkm_userns *u;
+	char text[8];
+	bool allow;
+	int ret = 0;
+
+	if (*ppos || !count || count >= sizeof(text))
+		return -EINVAL;
+	if (!droid_lkm_userns_is_ours(ns) ||
+	    !droid_lkm_userns_file_capable(file, ns, CAP_SYS_ADMIN))
+		return -EPERM;
+	if (copy_from_user(text, ubuf, count))
+		return -EFAULT;
+	text[count] = 0;
+	if (count && text[count - 1] == '\n')
+		text[count - 1] = 0;
+	if (memchr(text, 0, count - (text[count - 1] == 0)))
+		return -EINVAL;
+	if (!strcmp(text, "allow"))
+		allow = true;
+	else if (!strcmp(text, "deny"))
+		allow = false;
+	else
+		return -EINVAL;
+	u = container_of(ns, struct droid_lkm_userns, uns);
+	mutex_lock(&droid_lkm_userns_map_lock);
+	if (allow) {
+		if (!(ns->flags & USERNS_SETGROUPS_ALLOWED))
+			ret = -EPERM;
+	} else if (u->gid_written) {
+		ret = -EPERM;
+	} else {
+		WRITE_ONCE(ns->flags, ns->flags & ~USERNS_SETGROUPS_ALLOWED);
+	}
+	if (!ret)
+		*ppos += count;
+	mutex_unlock(&droid_lkm_userns_map_lock);
+	return ret ? ret : count;
+}
+
+/* A proc inode may be cached across unshare/setns. Resolve the task's
+ * real namespace at open, and keep that snapshot for the whole open file. */
+static int droid_lkm_userns_map_open(struct inode *inode, struct file *file)
+{
+	struct task_struct *task = get_proc_task(inode);
+	const struct cred *cred;
+
+	if (!task)
+		return -ESRCH;
+	cred = get_task_cred(task);
+	file->private_data = cred->user_ns;
+	put_cred(cred);
+	put_task_struct(task);
+	return 0;
 }
 
 static const struct file_operations droid_lkm_userns_uid_map_fops = {
+	.open		= droid_lkm_userns_map_open,
 	.read		= droid_lkm_userns_uid_map_read,
-	.write		= droid_lkm_userns_map_write,
+	.write		= droid_lkm_userns_uid_map_write,
 	.llseek		= droid_lkm_misc_proc_llseek,
 	.owner		= THIS_MODULE,
 };
 
 static const struct file_operations droid_lkm_userns_gid_map_fops = {
+	.open		= droid_lkm_userns_map_open,
 	.read		= droid_lkm_userns_gid_map_read,
-	.write		= droid_lkm_userns_map_write,
+	.write		= droid_lkm_userns_gid_map_write,
 	.llseek		= droid_lkm_misc_proc_llseek,
 	.owner		= THIS_MODULE,
 };
 
 static const struct file_operations droid_lkm_userns_setgroups_fops = {
+	.open		= droid_lkm_userns_map_open,
 	.read		= droid_lkm_userns_setgroups_read,
 	.write		= droid_lkm_userns_setgroups_write,
 	.llseek		= droid_lkm_misc_proc_llseek,
@@ -257,26 +356,18 @@ static struct dentry *droid_lkm_userns_proc_instantiate(struct dentry *dentry,
 							struct task_struct *task,
 							const struct file_operations *fops)
 {
-	struct user_namespace *ns;
-	const struct cred *cred;
 	struct inode *inode;
-
-	cred = get_task_cred(task);
-	/*
-	 * stable without a reference, the field is either the static initial namespace or one this
-	 * module owns
-	 */
-	ns = cred->user_ns;
-	put_cred(cred);
 
 	inode = droid_lkm_userns_proc_make_inode(dentry->d_sb, task,
 						 S_IFREG | 0644);
 	if (!inode)
 		return ERR_PTR(-ENOENT);
 
-	/* i_private is free on a pid entry inode, so the read and the write need no task lookup */
+	/* Cached inodes hold fops even before opening a file. Keep the code
+	 * alive once any map inode has been published. */
+	if (!xchg(&droid_lkm_userns_proc_pinned, true))
+		__module_get(THIS_MODULE);
 	inode->i_fop = fops;
-	inode->i_private = ns;
 	droid_lkm_userns_proc_update_inode(task, inode);
 
 	droid_lkm_userns_proc_set_d_op(dentry, droid_lkm_userns_proc_dentry_ops);
@@ -303,6 +394,8 @@ droid_lkm_userns_proc_lookup(struct inode *dir, struct dentry *dentry,
 	unsigned int i;
 
 	res = orig(dir, dentry, flags);
+	if (!droid_lkm_userns_ready())
+		return res;
 	/* a NULL return is a successful alias, only ENOENT means "no entry" */
 	if (!IS_ERR(res) || PTR_ERR(res) != -ENOENT)
 		return res;
@@ -386,6 +479,9 @@ static int droid_lkm_userns_proc_resolve(void)
 	};
 	unsigned int i;
 
+	droid_lkm_userns_file_capable = (void *)droid_lkm_misc_sym("file_ns_capable");
+	if (!droid_lkm_userns_file_capable)
+		return -ENOENT;
 	for (i = 0; i < ARRAY_SIZE(syms); i++) {
 		*syms[i].slot = (void *)droid_lkm_misc_sym(syms[i].name);
 		if (!*syms[i].slot) {
@@ -414,17 +510,14 @@ int droid_lkm_userns_proc_init(void)
 		droid_lkm_misc_warn("hook proc_tgid_base_lookup failed: %d\n", ret);
 		return ret;
 	}
-	droid_lkm_userns_proc_tgid_orig = (void *)droid_lkm_userns_proc_tgid_hook.orig;
 
 	ret = hk_inline_hook(&droid_lkm_userns_proc_tid_hook, "proc_tid_base_lookup",
 			     "droid_lkm_userns_proc_tid_lookup");
 	if (ret) {
 		droid_lkm_misc_warn("hook proc_tid_base_lookup failed: %d\n", ret);
 		hk_inline_unhook(&droid_lkm_userns_proc_tgid_hook);
-		droid_lkm_userns_proc_tgid_orig = NULL;
 		return ret;
 	}
-	droid_lkm_userns_proc_tid_orig = (void *)droid_lkm_userns_proc_tid_hook.orig;
 
 	droid_lkm_misc_info("id map files ready\n");
 	droid_lkm_misc_report("userns id map files", "ready",
@@ -434,18 +527,15 @@ int droid_lkm_userns_proc_init(void)
 }
 
 /*
- * the inodes hold this module's f_op and the dentry cache keeps them. an open file pins the
- * module through f_op->owner and the kernel drops the dentry when the task exits, so once
- * those tasks are gone the module can be unloaded
+ * Unregister lookup hooks only before any map inode has been published.
+ * Publication pins the module, including unopened cached inodes.
  */
 void droid_lkm_userns_proc_exit(void)
 {
 	if (droid_lkm_userns_proc_tid_orig) {
 		hk_inline_unhook(&droid_lkm_userns_proc_tid_hook);
-		droid_lkm_userns_proc_tid_orig = NULL;
 	}
 	if (droid_lkm_userns_proc_tgid_orig) {
 		hk_inline_unhook(&droid_lkm_userns_proc_tgid_hook);
-		droid_lkm_userns_proc_tgid_orig = NULL;
 	}
 }

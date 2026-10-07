@@ -37,7 +37,7 @@ module_param_named(xt, droid_lkm_misc_xt_enable, bool, 0444);
 MODULE_PARM_DESC(xt, "register the ported xt matches and targets");
 
 module_param_named(userns, droid_lkm_misc_userns_enable, bool, 0444);
-MODULE_PARM_DESC(userns, "offer the /proc/<pid>/ns/user entry and the fake user namespace");
+MODULE_PARM_DESC(userns, "root-only identity user namespace compatibility (not an isolation boundary)");
 
 module_param_named(devtmpfs, droid_lkm_misc_devtmpfs_enable, bool, 0444);
 MODULE_PARM_DESC(devtmpfs, "offer the devtmpfs filesystem the kernel was built without");
@@ -102,9 +102,21 @@ static int __init droid_lkm_misc_init(void)
 	if (droid_lkm_misc_xt_enable) {
 		ret = droid_lkm_misc_xt_init();
 		if (ret)
-			return ret;
+			goto err_features;
 	} else {
 		droid_lkm_misc_report("xt", "off", "xt=0");
+	}
+
+	if (droid_lkm_misc_userns_enable) {
+		ret = droid_lkm_userns_init();
+		if (ret && ret != -EOPNOTSUPP) {
+			droid_lkm_misc_err("userns initialization failed: %d\n", ret);
+			goto err_features;
+		}
+		if (!ret)
+			droid_lkm_misc_userns_up = true;
+	} else {
+		droid_lkm_misc_report("userns", "off", "userns=0");
 	}
 
 	if (droid_lkm_misc_devtmpfs_enable) {
@@ -115,17 +127,15 @@ static int __init droid_lkm_misc_init(void)
 		droid_lkm_misc_report("devtmpfs", "off", "devtmpfs=0");
 	}
 
-	if (droid_lkm_misc_userns_enable) {
-		ret = droid_lkm_userns_init();
-		if (ret)
-			droid_lkm_misc_warn("userns unavailable: %d\n", ret);
-		else
-			droid_lkm_misc_userns_up = true;
-	} else {
-		droid_lkm_misc_report("userns", "off", "userns=0");
-	}
-
 	return 0;
+
+err_features:
+	droid_lkm_misc_xt_exit();
+	droid_lkm_misc_proc_exit();
+	hk_exit();
+	hk_exit_block();
+	droid_lkm_misc_hk_up = false;
+	return ret;
 }
 
 static void __exit droid_lkm_misc_exit(void)
@@ -139,6 +149,7 @@ static void __exit droid_lkm_misc_exit(void)
 	droid_lkm_misc_proc_exit();
 	if (droid_lkm_misc_hk_up) {
 		hk_exit();
+		hk_exit_block();
 		droid_lkm_misc_hk_up = false;
 	}
 	droid_lkm_misc_info("unloaded\n");

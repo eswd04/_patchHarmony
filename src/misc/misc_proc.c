@@ -24,6 +24,7 @@
 
 #include "misc.h"
 #include "misc_proc.h"
+#include "userns/userns.h"
 
 #define DROID_LKM_MISC_REPORT_SLOTS 24
 #define DROID_LKM_MISC_REPORT_NAME 28
@@ -108,10 +109,10 @@ ssize_t droid_lkm_misc_proc_read_text(char __user *ubuf, size_t count,
 	if (*ppos >= len)
 		return 0;
 
-	if (count > len - *ppos)
+	if (count > (size_t)(len - *ppos))
 		count = len - *ppos;
 
-	if (copy_to_user(ubuf + *ppos, text + *ppos, count))
+	if (copy_to_user(ubuf, text + *ppos, count))
 		return -EFAULT;
 
 	*ppos += count;
@@ -166,7 +167,8 @@ static int droid_lkm_misc_report_text(char *buf, int size)
 	}
 
 	mutex_unlock(&droid_lkm_misc_report_lock);
-
+	len += scnprintf(buf + len, size - len, "%-24s %-14s %u retained (max 1024)\n",
+			 "userns objects", "live", droid_lkm_userns_live());
 	return len;
 }
 

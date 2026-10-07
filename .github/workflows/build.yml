@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Test User NS map and proc helpers
+        run: python3 tests/run-userns-unit.py
       - name: Test vendor fixup initialization failures
         run: python3 tests/run-compat-unit.py
       - name: Test ARM64 hook relocation
@@ -66,4 +68,5 @@ jobs:
           path: |
             out/${{ matrix.kmi }}/droid_lkm.ko
             out/${{ matrix.kmi }}/droid_lkm_compat.ko
+            out/${{ matrix.kmi }}/droid_lkm_misc.ko
           if-no-files-found: warn

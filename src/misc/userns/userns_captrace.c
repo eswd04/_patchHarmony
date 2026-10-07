@@ -30,9 +30,6 @@
 bool droid_lkm_userns_captrace_on;
 
 static struct hk_inline droid_lkm_userns_cap_hook;
-static int (*droid_lkm_userns_cap_orig)(const struct cred *cred,
-					struct user_namespace *targ_ns,
-					int cap, unsigned int opts);
 static atomic_t droid_lkm_userns_cap_busy = ATOMIC_INIT(0);
 
 /*
@@ -48,11 +45,8 @@ __nocfi noinline int droid_lkm_userns_cap_wrap(const struct cred *cred,
 		    unsigned int);
 	int ret;
 
-	/*
-	 * a call landing here between the patch and the trampoline is refused, so the window can
-	 * never become a call through a null pointer
-	 */
-	orig = droid_lkm_userns_cap_orig;
+	/* The engine publishes orig before installing the entry detour. */
+	orig = (typeof(orig))READ_ONCE(droid_lkm_userns_cap_hook.orig);
 	if (!orig)
 		return -EPERM;
 
@@ -95,17 +89,14 @@ int droid_lkm_userns_captrace_init(void)
 		return ret;
 	}
 
-	/* orig has to be the trampoline, never the symbol */
-	droid_lkm_userns_cap_orig = (void *)droid_lkm_userns_cap_hook.orig;
 	droid_lkm_misc_info("cap trace on\n");
 	return 0;
 }
 
 void droid_lkm_userns_captrace_exit(void)
 {
-	if (!droid_lkm_userns_cap_orig)
+	if (!READ_ONCE(droid_lkm_userns_cap_hook.orig))
 		return;
 
 	hk_inline_unhook(&droid_lkm_userns_cap_hook);
-	droid_lkm_userns_cap_orig = NULL;
 }
