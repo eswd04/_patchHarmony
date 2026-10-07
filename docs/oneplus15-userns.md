@@ -119,13 +119,27 @@ Clang `r536225`，完成三个模块的编译、MODPOST、链接和 BTF 生成�
 另用编译器计算的 105 个结构体大小/字段偏移对比手机 BTF，全部一致。
 详细构建资料与实机测试顺序见 [compat 重启排查](oneplus15-compat-reboot.md)。
 
-以下仅记录加载顺序。修复版尚未实机验收，不据此重复运行旧文件或全套 smoke。
-使用时必须替换整组模块，并避免旧模块自动加载；不要强制卸载已有 User NS。
+修复版已通过上述 10 项单项实机测试。使用时必须替换整组模块，并避免旧模块
+自动加载；不要强制卸载已有 User NS。
+
+将 `scripts/load-op15.sh` 放到三个 `.ko` 所在目录，在手机 root shell 中执行：
+
+```sh
+cd /data/local/tmp/dlkm-op15-cfi-fix
+sh load-op15.sh
+# 脚本位于其他目录时，可指定模块目录：
+# sh /path/to/load-op15.sh /data/local/tmp/dlkm-op15-cfi-fix
+```
+
+脚本按以下顺序加载，任一步失败即停止。重复执行会检查已加载模块的参数，
+参数一致时跳过；不会自动卸载模块或启动测试。脚本限定当前已验证的内核版本，
+并读取 status 确认 User NS 为 ready。参数检查不能确认已加载模块的代码版本，
+更换 `.ko` 后须重启再加载新文件。
 
 ```sh
 insmod droid_lkm.ko gate=0
 # OnePlus vendor 兼容模块按原有需求加载
-insmod droid_lkm_compat.ko
+insmod droid_lkm_compat.ko inline_hook=1 ghost=1
 # 先只验收 User NS
 insmod droid_lkm_misc.ko userns=1 xt=0 devtmpfs=0 verbose=1
 cat /proc/droid_lkm_misc/status
